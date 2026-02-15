@@ -7,6 +7,313 @@ import subprocess
 import sys
 from datetime import datetime
 import yt_dlp
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TPE1, TIT2, TRCK, TALB, ID3NoHeaderError
+from mutagen.oggopus import OggOpus
+from mutagen.mp4 import MP4
+
+
+class MetadataWindow:
+    """다운로드된 오디오 파일의 메타데이터를 편집하는 서브 윈도우."""
+
+    AUDIO_EXTS = (".opus", ".mp3", ".m4a")
+
+    def __init__(self, parent, scan_dir):
+        self.parent = parent
+        self.scan_dir = scan_dir
+        # {filepath: {"artist": str, "title": str, "track": str}}
+        self.file_meta = {}
+        self.files = []
+        self.current_index = None
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("메타 정보 편집")
+        self.win.geometry("640x420")
+        self.win.resizable(True, True)
+        self.win.grab_set()
+        self.win.transient(parent)
+
+        self._scan_files()
+        if not self.files:
+            messagebox.showinfo("알림", "오디오 파일이 없습니다.", parent=self.win)
+            self.win.destroy()
+            return
+
+        self._build_ui()
+        self._select_file(0)
+
+    def _scan_files(self):
+        """저장 경로에서 오디오 파일을 스캔하고 기존 태그를 로드한다."""
+        try:
+            entries = sorted(os.listdir(self.scan_dir))
+        except OSError:
+            return
+        for name in entries:
+            if not name.lower().endswith(self.AUDIO_EXTS):
+                continue
+            path = os.path.join(self.scan_dir, name)
+            if not os.path.isfile(path):
+                continue
+            self.files.append(path)
+            self.file_meta[path] = self._read_tags(path)
+
+    @staticmethod
+    def _read_tags(path):
+        """파일에서 기존 메타데이터를 읽는다."""
+        meta = {"artist": "", "album": "", "title": "", "track": ""}
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".mp3":
+                try:
+                    tags = ID3(path)
+                except ID3NoHeaderError:
+                    return meta
+                meta["artist"] = str(tags.get("TPE1", ""))
+                meta["album"] = str(tags.get("TALB", ""))
+                meta["title"] = str(tags.get("TIT2", ""))
+                meta["track"] = str(tags.get("TRCK", ""))
+            elif ext == ".opus":
+                audio = OggOpus(path)
+                meta["artist"] = audio.get("artist", [""])[0]
+                meta["album"] = audio.get("album", [""])[0]
+                meta["title"] = audio.get("title", [""])[0]
+                meta["track"] = audio.get("tracknumber", [""])[0]
+            elif ext == ".m4a":
+                audio = MP4(path)
+                meta["artist"] = (audio.tags or {}).get("\xa9ART", [""])[0]
+                meta["album"] = (audio.tags or {}).get("\xa9alb", [""])[0]
+                meta["title"] = (audio.tags or {}).get("\xa9nam", [""])[0]
+                trkn = (audio.tags or {}).get("trkn")
+                if trkn:
+                    meta["track"] = str(trkn[0][0])
+        except Exception:
+            pass
+        return meta
+
+    def _build_ui(self):
+        # 좌측: 파일 목록
+        left = ttk.Frame(self.win)
+        left.pack(side="left", fill="both", expand=True, padx=(10, 5), pady=10)
+
+        ttk.Label(left, text="파일 목록", font=("", 10, "bold")).pack(anchor="w")
+
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill="both", expand=True, pady=(5, 0))
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        self.file_listbox = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, activestyle="dotbox"
+        )
+        scrollbar.configure(command=self.file_listbox.yview)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for path in self.files:
+            self.file_listbox.insert("end", os.path.basename(path))
+
+        self.file_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
+
+        # 우측: 편집 패널
+        right = ttk.Frame(self.win, width=260)
+        right.pack(side="right", fill="y", padx=(5, 10), pady=10)
+        right.pack_propagate(False)
+
+        # --- 공통 필드 (아티스트 / 앨범) — 전체 파일에 동일 적용 ---
+        common_lf = ttk.LabelFrame(right, text="공통 (전체 적용)")
+        common_lf.pack(fill="x")
+
+        ttk.Label(common_lf, text="아티스트:").pack(anchor="w", padx=5)
+        self.artist_var = tk.StringVar()
+        ttk.Entry(common_lf, textvariable=self.artist_var).pack(
+            fill="x", padx=5, pady=(0, 6)
+        )
+
+        ttk.Label(common_lf, text="앨범명:").pack(anchor="w", padx=5)
+        self.album_var = tk.StringVar()
+        ttk.Entry(common_lf, textvariable=self.album_var).pack(
+            fill="x", padx=5, pady=(0, 6)
+        )
+
+        ttk.Button(
+            common_lf, text="전체에 적용", command=self._apply_common
+        ).pack(fill="x", padx=5, pady=(0, 8))
+
+        # --- 개별 파일 필드 (제목 / 트랙번호) ---
+        per_file_lf = ttk.LabelFrame(right, text="개별 파일")
+        per_file_lf.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(per_file_lf, text="제목:").pack(anchor="w", padx=5)
+        self.title_var = tk.StringVar()
+        ttk.Entry(per_file_lf, textvariable=self.title_var).pack(
+            fill="x", padx=5, pady=(0, 6)
+        )
+
+        ttk.Label(per_file_lf, text="트랙번호:").pack(anchor="w", padx=5)
+        self.track_var = tk.StringVar()
+        ttk.Entry(per_file_lf, textvariable=self.track_var).pack(
+            fill="x", padx=5, pady=(0, 8)
+        )
+
+        # --- 버튼 ---
+        btn_frame = ttk.Frame(right)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(
+            btn_frame, text="전체 자동 채우기", command=self._auto_fill_all
+        ).pack(fill="x", pady=2)
+        ttk.Button(
+            btn_frame, text="저장", command=self._save_current
+        ).pack(fill="x", pady=2)
+        ttk.Button(
+            btn_frame, text="전체 저장", command=self._save_all
+        ).pack(fill="x", pady=2)
+        ttk.Button(
+            btn_frame, text="닫기", command=self._close
+        ).pack(fill="x", pady=2)
+
+        # 상태 표시
+        self.status_label = ttk.Label(right, text="", foreground="green", wraplength=240)
+        self.status_label.pack(anchor="w", pady=(10, 0))
+
+    def _select_file(self, index):
+        """파일 목록에서 특정 인덱스를 선택하고 편집 패널을 갱신한다."""
+        if index < 0 or index >= len(self.files):
+            return
+        self._flush_current()
+        self.current_index = index
+        self.file_listbox.selection_clear(0, "end")
+        self.file_listbox.selection_set(index)
+        self.file_listbox.see(index)
+        path = self.files[index]
+        meta = self.file_meta[path]
+        # 공통 필드: 첫 파일 선택 시에만 초기화 (이후에는 사용자 입력 유지)
+        if self.artist_var.get() == "" and meta["artist"]:
+            self.artist_var.set(meta["artist"])
+        if self.album_var.get() == "" and meta["album"]:
+            self.album_var.set(meta["album"])
+        self.title_var.set(meta["title"])
+        self.track_var.set(meta["track"])
+
+    def _on_listbox_select(self, _event):
+        sel = self.file_listbox.curselection()
+        if sel:
+            self._select_file(sel[0])
+
+    def _flush_current(self):
+        """현재 편집 중인 파일의 변경사항을 메모리에 반영한다."""
+        if self.current_index is not None:
+            path = self.files[self.current_index]
+            self.file_meta[path] = {
+                "artist": self.artist_var.get(),
+                "album": self.album_var.get(),
+                "title": self.title_var.get(),
+                "track": self.track_var.get(),
+            }
+
+    @staticmethod
+    def _parse_filename(path):
+        """파일명에서 아티스트와 제목을 유추한다."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        if " - " in name:
+            artist, title = name.split(" - ", 1)
+            return artist.strip(), title.strip()
+        return "", name.strip()
+
+    def _apply_common(self):
+        """공통 필드(아티스트, 앨범)를 모든 파일에 일괄 적용."""
+        artist = self.artist_var.get()
+        album = self.album_var.get()
+        for path in self.files:
+            self.file_meta[path]["artist"] = artist
+            self.file_meta[path]["album"] = album
+        self.status_label.configure(
+            text="아티스트/앨범을 전체 적용했습니다.", foreground="green"
+        )
+
+    def _auto_fill_all(self):
+        """모든 파일에 파일명 유추 + 트랙번호 자동 부여."""
+        self._flush_current()
+        artist_common = self.artist_var.get()
+        album_common = self.album_var.get()
+        for i, path in enumerate(self.files):
+            artist, title = self._parse_filename(path)
+            # 공통 필드에 값이 있으면 그것을 우선 사용
+            self.file_meta[path] = {
+                "artist": artist_common if artist_common else artist,
+                "album": album_common,
+                "title": title,
+                "track": str(i + 1),
+            }
+        # 현재 선택 파일 갱신
+        if self.current_index is not None:
+            self._select_file(self.current_index)
+        self.status_label.configure(text="전체 자동 채우기 완료", foreground="green")
+
+    def _save_tags(self, path, meta):
+        """mutagen으로 메타데이터를 파일에 쓴다."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".mp3":
+            audio = MP3(path)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags["TPE1"] = TPE1(encoding=3, text=meta["artist"])
+            audio.tags["TALB"] = TALB(encoding=3, text=meta["album"])
+            audio.tags["TIT2"] = TIT2(encoding=3, text=meta["title"])
+            audio.tags["TRCK"] = TRCK(encoding=3, text=meta["track"])
+            audio.save()
+        elif ext == ".opus":
+            audio = OggOpus(path)
+            audio["artist"] = meta["artist"]
+            audio["album"] = meta["album"]
+            audio["title"] = meta["title"]
+            audio["tracknumber"] = meta["track"]
+            audio.save()
+        elif ext == ".m4a":
+            audio = MP4(path)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags["\xa9ART"] = [meta["artist"]]
+            audio.tags["\xa9alb"] = [meta["album"]]
+            audio.tags["\xa9nam"] = [meta["title"]]
+            track_num = int(meta["track"]) if meta["track"].isdigit() else 0
+            audio.tags["trkn"] = [(track_num, 0)]
+            audio.save()
+
+    def _save_current(self):
+        """현재 선택된 파일의 메타데이터를 저장한다."""
+        if self.current_index is None:
+            return
+        self._flush_current()
+        path = self.files[self.current_index]
+        meta = self.file_meta[path]
+        try:
+            self._save_tags(path, meta)
+            name = os.path.basename(path)
+            self.status_label.configure(text=f"저장 완료: {name}", foreground="green")
+        except Exception as e:
+            self.status_label.configure(text=f"저장 오류: {e}", foreground="red")
+
+    def _save_all(self):
+        """모든 파일의 메타데이터를 저장한다."""
+        self._flush_current()
+        ok, fail = 0, 0
+        for path in self.files:
+            meta = self.file_meta[path]
+            try:
+                self._save_tags(path, meta)
+                ok += 1
+            except Exception:
+                fail += 1
+        msg = f"전체 저장 완료: {ok}개 성공"
+        color = "green"
+        if fail:
+            msg += f", {fail}개 실패"
+            color = "orange"
+        self.status_label.configure(text=msg, foreground=color)
+
+    def _close(self):
+        self.win.grab_release()
+        self.win.destroy()
 
 
 class PlaylistWindow:
@@ -122,7 +429,7 @@ class YtMp3App:
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube 오디오 다운로더")
-        self.root.geometry("620x580")
+        self.root.geometry("620x620")
         self.root.resizable(False, False)
 
         self.downloading = False
@@ -229,9 +536,35 @@ class YtMp3App:
             btn_frame, text="다운로드 폴더 열기", command=self._open_folder
         ).pack(side="left", expand=True)
 
+        ttk.Button(
+            btn_frame, text="메타 정보 입력", command=self._open_metadata_window
+        ).pack(side="left", expand=True)
+
         # --- 프로그레스 바 ---
-        self.progress = ttk.Progressbar(self.root, mode="determinate")
-        self.progress.pack(fill="x", **pad)
+        prog_frame = ttk.LabelFrame(self.root, text="진행률")
+        prog_frame.pack(fill="x", **pad)
+
+        # 전체 진행 (여러 곡일 때만 표시, 초기에는 숨김)
+        self.overall_frame = ttk.Frame(prog_frame)
+        # pack 하지 않음 — _show_overall(True) 시 표시
+
+        self.overall_label = ttk.Label(self.overall_frame, text="전체: (0/0)")
+        self.overall_label.pack(side="left", padx=(10, 5))
+        self.overall_progress = ttk.Progressbar(
+            self.overall_frame, mode="determinate"
+        )
+        self.overall_progress.pack(
+            side="left", fill="x", expand=True, padx=(0, 10), pady=4
+        )
+
+        # 개별 파일 진행
+        self.file_frame = ttk.Frame(prog_frame)
+        self.file_frame.pack(fill="x", pady=(0, 4))
+
+        self.file_label = ttk.Label(self.file_frame, text="현재 파일:")
+        self.file_label.pack(side="left", padx=(10, 5))
+        self.progress = ttk.Progressbar(self.file_frame, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=4)
 
         # --- 로그 ---
         log_frame = ttk.LabelFrame(self.root, text="진행 상황")
@@ -270,6 +603,13 @@ class YtMp3App:
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
+
+    def _open_metadata_window(self):
+        scan_dir = self.save_path.get().strip()
+        if not scan_dir or not os.path.isdir(scan_dir):
+            messagebox.showwarning("알림", "저장 경로가 존재하지 않습니다.")
+            return
+        MetadataWindow(self.root, scan_dir)
 
     def _browse_path(self):
         path = filedialog.askdirectory(initialdir=self.save_path.get())
@@ -421,6 +761,16 @@ class YtMp3App:
             filename = os.path.basename(d.get("filename", ""))
             self.root.after(0, self._log, f"변환 중: {filename}")
 
+    def _show_overall(self, show):
+        if show:
+            self.overall_frame.pack(fill="x", pady=(4, 0), before=self.file_frame)
+        else:
+            self.overall_frame.pack_forget()
+
+    def _update_overall(self, current, total):
+        self.overall_label.configure(text=f"전체: ({current}/{total})")
+        self.overall_progress["value"] = current / total * 100 if total else 0
+
     def _download(self, urls, dest, fmt, ffmpeg_loc):
         metadata_pps = [
             {"key": "FFmpegMetadata"},
@@ -452,12 +802,29 @@ class YtMp3App:
                 *metadata_pps,
             ]
 
+        total = len(urls)
+        is_multi = total > 1
+
+        if is_multi:
+            self.root.after(0, self._show_overall, True)
+            self.root.after(0, self._update_overall, 0, total)
+
         try:
             self.root.after(
-                0, self._log, f"다운로드 시작: {len(urls)}개 항목"
+                0, self._log, f"다운로드 시작: {total}개 항목"
             )
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download(urls)
+                for i, url in enumerate(urls):
+                    self.root.after(0, self._set_progress, 0)
+                    if is_multi:
+                        self.root.after(
+                            0, self._log, f"--- ({i + 1}/{total}) ---"
+                        )
+                    ydl.download([url])
+                    if is_multi:
+                        self.root.after(
+                            0, self._update_overall, i + 1, total
+                        )
             self.root.after(0, self._log, "✅ 다운로드 완료!")
             self.root.after(
                 0,
@@ -473,6 +840,8 @@ class YtMp3App:
             self._save_log(dest)
             self.downloading = False
             self.root.after(0, lambda: self.download_btn.configure(state="normal"))
+            if is_multi:
+                self.root.after(0, self._show_overall, False)
 
 
 if __name__ == "__main__":
