@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -426,6 +427,9 @@ class PlaylistWindow:
 
 
 class YtMp3App:
+    CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".yt-mp3")
+    CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube 오디오 다운로더")
@@ -441,19 +445,47 @@ class YtMp3App:
             "AAC (192kbps)": {"codec": "aac", "ext": "m4a"},
         }
 
+        config = self._load_config()
         default_path = os.path.join(os.path.expanduser("~"), "Music", "yt-mp3")
-        self.save_path = tk.StringVar(value=default_path)
-        self.ffmpeg_path = tk.StringVar(value="")
-        self.selected_format = tk.StringVar(value="Opus (원본, 변환 없음)")
+        self.save_path = tk.StringVar(value=config.get("save_path", default_path))
+        self.ffmpeg_path = tk.StringVar(value=config.get("ffmpeg_path", ""))
+        self.selected_format = tk.StringVar(
+            value=config.get("audio_format", "Opus (원본, 변환 없음)")
+            if config.get("audio_format") in self.formats
+            else "Opus (원본, 변환 없음)"
+        )
 
         self._build_ui()
         self._check_ffmpeg_on_startup()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _load_config(self):
+        try:
+            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self):
+        config = {
+            "save_path": self.save_path.get(),
+            "ffmpeg_path": self.ffmpeg_path.get(),
+            "audio_format": self.selected_format.get(),
+        }
+        os.makedirs(self.CONFIG_DIR, exist_ok=True)
+        with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+    def _on_close(self):
+        self._save_config()
+        self.root.destroy()
 
     def _check_ffmpeg_on_startup(self):
         ffmpeg_loc = shutil.which("ffmpeg")
         if ffmpeg_loc:
             ffmpeg_dir = os.path.dirname(ffmpeg_loc)
-            self.ffmpeg_path.set(ffmpeg_dir)
+            if not self.ffmpeg_path.get():
+                self.ffmpeg_path.set(ffmpeg_dir)
             self.ffmpeg_status.configure(
                 text=f"시스템 PATH에서 자동 설정됨", foreground="green"
             )
