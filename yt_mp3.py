@@ -490,9 +490,13 @@ class YtMp3App:
                 text=f"시스템 PATH에서 자동 설정됨", foreground="green"
             )
         else:
-            self.ffmpeg_status.configure(
-                text="ffmpeg를 찾을 수 없습니다. MP3/AAC 변환에 필요합니다.", foreground="red"
-            )
+            if sys.platform == "win32":
+                hint = "ffmpeg 미설치. 설치: winget install Gyan.FFmpeg"
+            elif sys.platform == "darwin":
+                hint = "ffmpeg 미설치. 설치: brew install ffmpeg"
+            else:
+                hint = "ffmpeg 미설치. 설치: sudo apt install ffmpeg"
+            self.ffmpeg_status.configure(text=hint, foreground="red")
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 5}
@@ -805,6 +809,7 @@ class YtMp3App:
 
     def _download(self, urls, dest, fmt, ffmpeg_loc):
         metadata_pps = [
+            {"key": "FFmpegThumbnailsConvertor", "format": "png"},
             {"key": "FFmpegMetadata"},
             {"key": "EmbedThumbnail"},
         ]
